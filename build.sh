@@ -60,6 +60,9 @@ command_build() {
         fi
         tar -xJf "$tarball" -C "$src" --strip-components=1
         rm -f "$tarball"
+        # The tarball holds a .git/HEAD naming the release commit, for the version string, and no
+        # objects, so git cannot commit on top of it; a fresh repository replaces it.
+        rm -rf "$src/.git"
         echo "$GODOT_VERSION" > "$src/.godot-version"
         git -C "$src" init -q
         git -C "$src" add -A
