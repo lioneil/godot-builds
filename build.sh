@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds the Godot editor from its source with the patches in scripts/godot/patches/.
+# Builds the Godot editor from its source with the patches in patches/ beside this script.
+# requirements.txt beside this script lists the Python packages the build needs.
 #
 #   build.sh stamp                         print the engine's stamp: the version and a hash of this script,
 #                                          the SCons pin and the patches
@@ -38,13 +39,15 @@ stamp() {
 
 command_build() {
     local src="$1" install="$2"
+    local current
+    current="$(stamp)"
     local missing=() cmd
-    for cmd in g++ pkg-config git xz curl scons; do
+    for cmd in g++ pkg-config git xz curl scons wayland-scanner; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
         echo "Missing prerequisites: ${missing[*]}" >&2
-        echo "On Ubuntu: sudo apt install build-essential git xz-utils pkg-config curl, and pip install -r scripts/godot/requirements.txt" >&2
+        echo "On Ubuntu: sudo apt install build-essential git xz-utils pkg-config curl libwayland-bin, and pip install -r requirements.txt from this folder" >&2
         exit 1
     fi
 
@@ -63,17 +66,17 @@ command_build() {
         # The tarball holds a .git/HEAD naming the release commit, for the version string, and no
         # objects, so git cannot commit on top of it; a fresh repository replaces it.
         rm -rf "$src/.git"
-        echo "$GODOT_VERSION" > "$src/.godot-version"
         git -C "$src" init -q
         git -C "$src" add -A
         git -C "$src" -c user.name=build -c user.email=build@localhost commit -q -m "Godot $GODOT_VERSION source"
+        echo "$GODOT_VERSION" > "$src/.godot-version"
     fi
 
-    git -C "$src" checkout -q -- .
+    git -C "$src" reset -q --hard
     local patch
     for patch in "$HERE"/patches/*.patch; do
-        if ! git -C "$src" apply "$patch"; then
-            echo "Patch $(basename "$patch") does not apply to Godot $GODOT_VERSION: rebase it with the steps in docs/wiki/godot-notes.md (The patched engine)." >&2
+        if ! git -C "$src" apply --index "$patch"; then
+            echo "Patch $(basename "$patch") does not apply to Godot $GODOT_VERSION." >&2
             exit 1
         fi
     done
@@ -82,26 +85,35 @@ command_build() {
 
     mkdir -p "$install"
     rm -f "$install/STAMP"
-    cp "$src/bin/godot.linuxbsd.editor.x86_64" "$install/godot"
-    chmod 755 "$install/godot"
-    stamp > "$install/STAMP"
+    cp "$src/bin/godot.linuxbsd.editor.x86_64" "$install/godot.new"
+    chmod 755 "$install/godot.new"
+    mv -f "$install/godot.new" "$install/godot"
+    echo "$current" > "$install/STAMP"
 }
 
 command_fetch() {
     local install="$1"
-    local current archive
+    local current url archive code tmp
     current="$(stamp)"
-    archive="$install/godot.tar.xz"
+    url="$RELEASES/$current/godot.tar.xz"
     mkdir -p "$install"
     rm -f "$install/STAMP"
-    if ! curl --fail --location --silent --show-error --output "$archive" "$RELEASES/$current/godot.tar.xz"; then
-        rm -f "$archive"
-        echo "No prebuilt engine for $current: publish the patch set with scripts/godot/publish.sh and wait for its build." >&2
+    tmp="$(mktemp -d "$install/fetch.XXXXXX")"
+    archive="$tmp/godot.tar.xz"
+    code="$(curl --location --silent --show-error --retry 3 --output "$archive" --write-out '%{http_code}' "$url" || true)"
+    if [ "$code" != "200" ]; then
+        rm -rf "$tmp"
+        if [ "$code" = "404" ]; then
+            echo "No prebuilt engine for $current: publish this patch set and wait for its build." >&2
+        else
+            echo "Downloading $url failed (HTTP ${code:-000})." >&2
+        fi
         exit 1
     fi
-    tar -xJf "$archive" -C "$install" godot
-    rm -f "$archive"
-    chmod 755 "$install/godot"
+    tar -xJf "$archive" -C "$tmp" godot
+    chmod 755 "$tmp/godot"
+    mv -f "$tmp/godot" "$install/godot"
+    rm -rf "$tmp"
     echo "$current" > "$install/STAMP"
 }
 

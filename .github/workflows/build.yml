@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -29,10 +33,14 @@ jobs:
           STAMP: ${{ steps.stamp.outputs.stamp }}
         run: |
           set -euo pipefail
-          if gh release view "$STAMP" >/dev/null 2>&1; then
+          complete="$(gh release view "$STAMP" --json isDraft,assets --jq '(.isDraft | not) and any(.assets[]; .name == "godot.tar.xz")' 2>/dev/null || true)"
+          if [ "$complete" = "true" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Release $STAMP exists; nothing to build." >> "$GITHUB_STEP_SUMMARY"
           else
+            if gh release view "$STAMP" >/dev/null 2>&1; then
+              gh release delete "$STAMP" --yes --cleanup-tag
+            fi
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -43,7 +51,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config xz-utils python3-venv \
             libx11-dev libxcursor-dev libxinerama-dev libxi-dev libxrandr-dev libgl-dev \
-            libudev-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev
+            libudev-dev libasound2-dev libpulse-dev libwayland-dev libwayland-bin libxkbcommon-dev
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -r requirements.txt
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
@@ -64,4 +72,5 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "$STAMP" godot.tar.xz --title "Godot $STAMP" \
+            --target "$GITHUB_SHA" \
             --notes "Godot editor for Linux x86_64, built from the patch set in this commit."
