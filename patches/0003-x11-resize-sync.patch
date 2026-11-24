@@ -1,28 +1,30 @@
 Answer the window manager's _NET_WM_SYNC_REQUEST on X11, so a resize draws in step with it.
 
-During an interactive resize, a maximise or a restore, a compositing window manager such as
-mutter sends the window a _NET_WM_SYNC_REQUEST client message carrying a serial, then sets the new
-size, and holds the window's contents back until the counter the window published in
-_NET_WM_SYNC_REQUEST_COUNTER reaches that serial, or until its own timeout of one second. A window
-that publishes no counter is shown at once, with the old frame stretched or the new area
-unpainted.
+During an interactive resize, a compositing window manager such as mutter sends the window a
+_NET_WM_SYNC_REQUEST client message carrying a serial, then sets the new size, and holds the
+window's contents back until the counter the window published in _NET_WM_SYNC_REQUEST_COUNTER
+reaches that serial, or until its own timeout of one second. It sends no request for a maximise or
+a restore. A window that publishes no counter is shown at once, with the old frame stretched or the
+new area unpainted.
 
 The window now lists _NET_WM_SYNC_REQUEST in WM_PROTOCOLS, creates an XSync counter and publishes
 it. The request's serial is stored when the message arrives. The counter is set to it in one of
 three places: after the buffer swap of the first frame drawn at the new size, at once when the
-configure that follows keeps the size (a move, or a request for the size the window has), and after
-100 ms in process_events when no configure or no frame comes, as for a minimized window. A newer
-request replaces an unanswered one, so the counter always ends at the newest serial. A destroyed
-window destroys its counter first.
+configure that follows keeps the size and no size change came since the request (a move, or a
+request for the size the window has), and after 100 ms in process_events when no configure or no
+frame comes, as for a minimized window. A newer request replaces an unanswered one, so the counter
+always ends at the newest serial. A destroyed window destroys its counter first.
 
 Only the GL path declares the handshake, since the buffer swap is where its frame is counted; the
-Vulkan path keeps the protocol list it has. swap_buffers() reads an atomic count of pending
-requests and takes no lock when there are none, so the idle frame path is unchanged. The GL
-managers gain a const getter for the window they swap.
+Vulkan path keeps the protocol list it has. swap_buffers() reads two atomic counts, of pending
+requests and of size changes not yet drawn, and takes no lock when both are 0, so the idle frame
+path is unchanged. The GL managers gain a const getter for the window they swap.
 
-The patch adds sync.h (libXext 1.3.5) and syncconst.h (xorgproto 2024.1) to thirdparty/linuxbsd_headers,
-names them in its README, and adds XSyncQueryExtension, XSyncInitialize, XSyncCreateCounter,
-XSyncSetCounter and XSyncDestroyCounter to the libXext wrapper in the generated format.
+The patch adds sync.h (libXext 1.3.5) and syncconst.h (xorgproto 2024.1) to
+thirdparty/linuxbsd_headers, names them in its README, and adds XSyncQueryExtension,
+XSyncInitialize, XSyncCreateCounter, XSyncSetCounter and XSyncDestroyCounter to the libXext wrapper
+in the generated format. Those five entries are added by hand, and a comment in both wrapper files
+says so. Tekton applies the patch to its pinned build of the engine.
 
 diff --git a/drivers/egl/egl_manager.h b/drivers/egl/egl_manager.h
 index 706df22..05359b8 100644
@@ -37,10 +39,18 @@ index 706df22..05359b8 100644
  	void set_use_vsync(bool p_use);
  	bool is_using_vsync() const;
 diff --git a/platform/linuxbsd/x11/display_server_x11.cpp b/platform/linuxbsd/x11/display_server_x11.cpp
-index 163a018..220e2d9 100644
+index 163a018..5bbe1b3 100644
 --- a/platform/linuxbsd/x11/display_server_x11.cpp
 +++ b/platform/linuxbsd/x11/display_server_x11.cpp
-@@ -2119,6 +2119,7 @@ void DisplayServerX11::delete_sub_window(DisplayServerEnums::WindowID p_id) {
+@@ -63,6 +63,7 @@
+ #include <X11/extensions/Xinerama.h>
+ #include <X11/extensions/Xrender.h>
+ #include <X11/extensions/shape.h>
++#include <X11/extensions/sync.h>
+ #endif
+ 
+ #ifdef RD_ENABLED
+@@ -2119,6 +2120,7 @@ void DisplayServerX11::delete_sub_window(DisplayServerEnums::WindowID p_id) {
  	}
  #endif
  
@@ -48,16 +58,26 @@ index 163a018..220e2d9 100644
  	XUnmapWindow(x11_display, wd.x11_window);
  	XDestroyWindow(x11_display, wd.x11_window);
  
-@@ -4557,6 +4558,16 @@ void DisplayServerX11::_window_changed(XEvent *event) {
+@@ -4557,6 +4559,26 @@ void DisplayServerX11::_window_changed(XEvent *event) {
  		new_rect.size.height = event->xconfigure.height;
  	}
  
-+	// A size change after a request is answered by the first frame drawn at that size. Any other
-+	// configure leaves nothing to draw, so the request is answered at once.
-+	if (wd.sync_pending) {
-+		if (new_rect.size != wd.size) {
-+			wd.sync_resized = true;
-+		} else if (!wd.sync_resized) {
++	// A size change after a request is answered by the first frame drawn at that size. A configure
++	// that keeps the size answers at once, unless a size change for this request still waits for its
++	// frame. The size is compared with the last configure's, since window_set_size() writes wd.size
++	// before its configure arrives.
++	if (wd.sync_counter != None) {
++		const bool size_changed = new_rect.size != wd.sync_configured_size;
++		wd.sync_configured_size = new_rect.size;
++		if (size_changed) {
++			if (!wd.sync_size_undrawn) {
++				wd.sync_size_undrawn = true;
++				sync_undrawn_count.increment();
++			}
++			if (wd.sync_pending) {
++				wd.sync_resized = true;
++			}
++		} else if (wd.sync_pending && !wd.sync_resized) {
 +			_sync_answer(wd);
 +		}
 +	}
@@ -65,7 +85,7 @@ index 163a018..220e2d9 100644
  	if (new_rect == Rect2i(wd.position, wd.size)) {
  		return;
  	}
-@@ -5679,7 +5690,21 @@ void DisplayServerX11::process_events() {
+@@ -5679,7 +5701,22 @@ void DisplayServerX11::process_events() {
  				if (ime_window_event) {
  					break;
  				}
@@ -81,14 +101,15 @@ index 163a018..220e2d9 100644
 +							sync_wd.sync_pending = true;
 +							sync_pending_count.increment();
 +						}
-+						sync_wd.sync_resized = false;
++						// A size change still waiting for its frame counts for the new request.
++						sync_wd.sync_resized = sync_wd.sync_size_undrawn;
 +						sync_wd.sync_request_usec = OS::get_singleton()->get_ticks_usec();
 +					}
 +				} else if ((unsigned int)event.xclient.data.l[0] == (unsigned int)wm_delete) {
  					_send_window_event(windows[window_id], DisplayServerEnums::WINDOW_EVENT_CLOSE_REQUEST);
  				}
  
-@@ -5766,6 +5791,17 @@ void DisplayServerX11::process_events() {
+@@ -5766,6 +5803,17 @@ void DisplayServerX11::process_events() {
  	}
  #endif
  
@@ -106,7 +127,7 @@ index 163a018..220e2d9 100644
  	_THREAD_SAFE_UNLOCK_
  
  	Input::get_singleton()->flush_buffered_events();
-@@ -5785,15 +5821,51 @@ void DisplayServerX11::release_rendering_thread() {
+@@ -5785,15 +5833,64 @@ void DisplayServerX11::release_rendering_thread() {
  void DisplayServerX11::swap_buffers() {
  	last_frame_usec.set(OS::get_singleton()->get_ticks_usec());
  #if defined(GLES3_ENABLED)
@@ -119,13 +140,22 @@ index 163a018..220e2d9 100644
 +		swapped_window = gl_manager_egl->get_current_window_id();
  		gl_manager_egl->swap_buffers();
  	}
-+	// The counter tells the window manager the frame at its new size is out. Most calls have no
-+	// request pending and take no lock.
-+	if (sync_pending_count.get() != 0) {
++	// The counter tells the window manager the frame at its new size is out. This order (a size
++	// change handled, then its frame drawn and swapped, then the answer) holds under the Safe thread
++	// model, where events, the draw and the swap run in turn on the main thread. Most calls have no
++	// request pending and no undrawn size change, and take no lock; a size change with no request
++	// takes the lock once, at the frame that draws it.
++	if (sync_pending_count.get() != 0 || sync_undrawn_count.get() != 0) {
 +		_THREAD_SAFE_LOCK_
 +		HashMap<DisplayServerEnums::WindowID, WindowData>::Iterator E = windows.find(swapped_window);
-+		if (E && E->value.sync_pending && E->value.sync_resized) {
-+			_sync_answer(E->value);
++		if (E) {
++			if (E->value.sync_size_undrawn) {
++				E->value.sync_size_undrawn = false;
++				sync_undrawn_count.decrement();
++			}
++			if (E->value.sync_pending && E->value.sync_resized) {
++				_sync_answer(E->value);
++			}
 +		}
 +		_THREAD_SAFE_UNLOCK_
 +	}
@@ -144,6 +174,10 @@ index 163a018..220e2d9 100644
 +}
 +
 +void DisplayServerX11::_sync_destroy_counter(WindowData &wd) {
++	if (wd.sync_size_undrawn) {
++		wd.sync_size_undrawn = false;
++		sync_undrawn_count.decrement();
++	}
 +	if (wd.sync_pending) {
 +		wd.sync_pending = false;
 +		wd.sync_resized = false;
@@ -158,7 +192,15 @@ index 163a018..220e2d9 100644
  void DisplayServerX11::_update_context(WindowData &wd) {
  	XClassHint *classHint = XAllocClassHint();
  
-@@ -6642,7 +6714,19 @@ DisplayServerEnums::WindowID DisplayServerX11::_create_window(DisplayServerEnums
+@@ -6557,6 +6654,7 @@ DisplayServerEnums::WindowID DisplayServerX11::_create_window(DisplayServerEnums
+ 	// window size, so we need to initialize them here.
+ 	wd.position = win_rect.position;
+ 	wd.size = win_rect.size;
++	wd.sync_configured_size = win_rect.size;
+ 
+ 	{
+ 		wd.x11_window = XCreateWindow(x11_display, RootWindow(x11_display, visualInfo.screen), win_rect.position.x, win_rect.position.y, win_rect.size.width > 0 ? win_rect.size.width : 1, win_rect.size.height > 0 ? win_rect.size.height : 1, 0, visualInfo.depth, InputOutput, visualInfo.visual, valuemask, &windowAttributes);
+@@ -6642,7 +6740,19 @@ DisplayServerEnums::WindowID DisplayServerX11::_create_window(DisplayServerEnums
  
  		/* set the titlebar name */
  		XStoreName(x11_display, wd.x11_window, "Godot");
@@ -179,7 +221,7 @@ index 163a018..220e2d9 100644
  		if (xdnd_aware != None) {
  			XChangeProperty(x11_display, wd.x11_window, xdnd_aware, XA_ATOM, 32, PropModeReplace, (unsigned char *)&xdnd_version, 1);
  		}
-@@ -7097,6 +7181,9 @@ DisplayServerX11::DisplayServerX11(const String &p_rendering_driver, DisplayServ
+@@ -7097,6 +7207,9 @@ DisplayServerX11::DisplayServerX11(const String &p_rendering_driver, DisplayServ
  
  	/* Atom internment */
  	wm_delete = XInternAtom(x11_display, "WM_DELETE_WINDOW", true);
@@ -189,7 +231,7 @@ index 163a018..220e2d9 100644
  	// Set Xdnd (drag & drop) support.
  	xdnd_aware = XInternAtom(x11_display, "XdndAware", False);
  	xdnd_enter = XInternAtom(x11_display, "XdndEnter", False);
-@@ -7269,6 +7356,18 @@ DisplayServerX11::DisplayServerX11(const String &p_rendering_driver, DisplayServ
+@@ -7269,6 +7382,18 @@ DisplayServerX11::DisplayServerX11(const String &p_rendering_driver, DisplayServ
  		ERR_FAIL_MSG("Video driver not found.");
  	}
  
@@ -208,7 +250,7 @@ index 163a018..220e2d9 100644
  	Point2i window_position;
  	if (p_position != nullptr) {
  		window_position = *p_position;
-@@ -7539,6 +7638,7 @@ DisplayServerX11::~DisplayServerX11() {
+@@ -7539,6 +7664,7 @@ DisplayServerX11::~DisplayServerX11() {
  			}
  		}
  #endif
@@ -217,36 +259,42 @@ index 163a018..220e2d9 100644
  		XDestroyWindow(x11_display, wd.x11_window);
  	}
 diff --git a/platform/linuxbsd/x11/display_server_x11.h b/platform/linuxbsd/x11/display_server_x11.h
-index 76e2d4d..d630f6b 100644
+index 76e2d4d..7e776a7 100644
 --- a/platform/linuxbsd/x11/display_server_x11.h
 +++ b/platform/linuxbsd/x11/display_server_x11.h
-@@ -107,6 +107,13 @@ class DisplayServerX11 : public DisplayServer {
+@@ -107,6 +107,15 @@ class DisplayServerX11 : public DisplayServer {
  	_THREAD_SAFE_CLASS_
  
  	Atom wm_delete;
 +	Atom wm_protocols = None;
 +	Atom net_wm_sync_request = None;
 +	Atom net_wm_sync_request_counter = None;
-+	// True when the GL driver is in use and libXext can answer the window manager's sync requests.
++	// True when the GL driver is in use and the X server has the Sync extension.
 +	bool xsync_available = false;
 +	// How many windows hold a sync request not yet answered; swap_buffers() reads it without the lock.
 +	SafeNumeric<uint32_t> sync_pending_count;
++	// How many windows have a size change no frame has been swapped for; read the same way.
++	SafeNumeric<uint32_t> sync_undrawn_count;
  	Atom xdnd_enter;
  	Atom xdnd_position;
  	Atom xdnd_status;
-@@ -195,8 +202,20 @@ class DisplayServerX11 : public DisplayServer {
+@@ -195,8 +204,24 @@ class DisplayServerX11 : public DisplayServer {
  		Rect2i parent_safe_rect;
  
  		unsigned int focus_order = 0;
 +
 +		// The window manager's resize handshake (_NET_WM_SYNC_REQUEST): the counter the window
 +		// publishes, the serial of the last request, whether it awaits an answer, whether a
-+		// size change followed it and when it arrived.
++		// size change followed it, when it arrived, the size of the last ConfigureNotify (written
++		// only in _window_changed) and whether a size change has come that no frame of this
++		// window has been swapped for since.
 +		XID sync_counter = None;
 +		uint64_t sync_serial = 0;
 +		bool sync_pending = false;
 +		bool sync_resized = false;
 +		uint64_t sync_request_usec = 0;
++		Size2i sync_configured_size;
++		bool sync_size_undrawn = false;
  	};
  
 +	void _sync_answer(WindowData &wd);
@@ -256,10 +304,18 @@ index 76e2d4d..d630f6b 100644
  	String im_text;
  
 diff --git a/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.c b/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.c
-index 501b852..4e78987 100644
+index 501b852..4e83745 100644
 --- a/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.c
 +++ b/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.c
-@@ -17,8 +17,14 @@
+@@ -2,6 +2,7 @@
+ // see https://github.com/hpvb/dynload-wrapper for details
+ // generated by generate-wrapper.py 0.7 on 2024-12-12 14:50:47
+ // flags: generate-wrapper.py --sys-include thirdparty/linuxbsd_headers/X11/extensions/Xext.h --include ./thirdparty/linuxbsd_headers/X11/extensions/shape.h --sys-include thirdparty/linuxbsd_headers/X11/extensions/shape.h --soname libXext.so.6 --init-name xext --output-header ./platform/linuxbsd/x11/dynwrappers/xext-so_wrap.h --output-implementation ./platform/linuxbsd/x11/dynwrappers/xext-so_wrap.c --ignore-other --implementation-header thirdparty/linuxbsd_headers/X11/Xlib.h
++// Hand-added after generation, from sync.h: XSyncQueryExtension, XSyncInitialize, XSyncCreateCounter, XSyncSetCounter and XSyncDestroyCounter. A regeneration must add --include for sync.h or re-add them.
+ //
+ #include <stdint.h>
+ 
+@@ -17,8 +18,14 @@
  #define XShapeSelectInput XShapeSelectInput_dylibloader_orig_xext
  #define XShapeInputSelected XShapeInputSelected_dylibloader_orig_xext
  #define XShapeGetRectangles XShapeGetRectangles_dylibloader_orig_xext
@@ -274,7 +330,7 @@ index 501b852..4e78987 100644
  #undef XShapeQueryExtension
  #undef XShapeQueryVersion
  #undef XShapeCombineRegion
-@@ -30,6 +36,11 @@
+@@ -30,6 +37,11 @@
  #undef XShapeSelectInput
  #undef XShapeInputSelected
  #undef XShapeGetRectangles
@@ -286,7 +342,7 @@ index 501b852..4e78987 100644
  #include <dlfcn.h>
  #include <stdio.h>
  int (*XShapeQueryExtension_dylibloader_wrapper_xext)(Display *, int *, int *);
-@@ -43,6 +54,11 @@ int (*XShapeQueryExtents_dylibloader_wrapper_xext)(Display *, Window, int *, int
+@@ -43,6 +55,11 @@ int (*XShapeQueryExtents_dylibloader_wrapper_xext)(Display *, Window, int *, int
  void (*XShapeSelectInput_dylibloader_wrapper_xext)(Display *, Window, unsigned long);
  unsigned long (*XShapeInputSelected_dylibloader_wrapper_xext)(Display *, Window);
  XRectangle *(*XShapeGetRectangles_dylibloader_wrapper_xext)(Display *, Window, int, int *, int *);
@@ -298,7 +354,7 @@ index 501b852..4e78987 100644
  int initialize_xext(int verbose) {
    void *handle;
    char *error;
-@@ -142,5 +158,45 @@ int initialize_xext(int verbose) {
+@@ -142,5 +159,45 @@ int initialize_xext(int verbose) {
        fprintf(stderr, "%s\n", error);
      }
    }
@@ -345,10 +401,18 @@ index 501b852..4e78987 100644
  return 0;
  }
 diff --git a/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.h b/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.h
-index 545665c..6fa3b67 100644
+index 545665c..d0822ca 100644
 --- a/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.h
 +++ b/platform/linuxbsd/x11/dynwrappers/xext-so_wrap.h
-@@ -18,8 +18,14 @@
+@@ -4,6 +4,7 @@
+ // see https://github.com/hpvb/dynload-wrapper for details
+ // generated by generate-wrapper.py 0.7 on 2024-12-12 14:50:47
+ // flags: generate-wrapper.py --sys-include thirdparty/linuxbsd_headers/X11/extensions/Xext.h --include ./thirdparty/linuxbsd_headers/X11/extensions/shape.h --sys-include thirdparty/linuxbsd_headers/X11/extensions/shape.h --soname libXext.so.6 --init-name xext --output-header ./platform/linuxbsd/x11/dynwrappers/xext-so_wrap.h --output-implementation ./platform/linuxbsd/x11/dynwrappers/xext-so_wrap.c --ignore-other --implementation-header thirdparty/linuxbsd_headers/X11/Xlib.h
++// Hand-added after generation, from sync.h: XSyncQueryExtension, XSyncInitialize, XSyncCreateCounter, XSyncSetCounter and XSyncDestroyCounter. A regeneration must add --include for sync.h or re-add them.
+ //
+ #include <stdint.h>
+ 
+@@ -18,8 +19,14 @@
  #define XShapeSelectInput XShapeSelectInput_dylibloader_orig_xext
  #define XShapeInputSelected XShapeInputSelected_dylibloader_orig_xext
  #define XShapeGetRectangles XShapeGetRectangles_dylibloader_orig_xext
@@ -363,7 +427,7 @@ index 545665c..6fa3b67 100644
  #undef XShapeQueryExtension
  #undef XShapeQueryVersion
  #undef XShapeCombineRegion
-@@ -31,6 +37,11 @@
+@@ -31,6 +38,11 @@
  #undef XShapeSelectInput
  #undef XShapeInputSelected
  #undef XShapeGetRectangles
@@ -375,7 +439,7 @@ index 545665c..6fa3b67 100644
  #ifdef __cplusplus
  extern "C" {
  #endif
-@@ -45,6 +56,11 @@ extern "C" {
+@@ -45,6 +57,11 @@ extern "C" {
  #define XShapeSelectInput XShapeSelectInput_dylibloader_wrapper_xext
  #define XShapeInputSelected XShapeInputSelected_dylibloader_wrapper_xext
  #define XShapeGetRectangles XShapeGetRectangles_dylibloader_wrapper_xext
@@ -387,7 +451,7 @@ index 545665c..6fa3b67 100644
  extern int (*XShapeQueryExtension_dylibloader_wrapper_xext)(Display *, int *, int *);
  extern int (*XShapeQueryVersion_dylibloader_wrapper_xext)(Display *, int *, int *);
  extern void (*XShapeCombineRegion_dylibloader_wrapper_xext)(Display *, Window, int, int, int, Region, int);
-@@ -56,6 +72,11 @@ extern int (*XShapeQueryExtents_dylibloader_wrapper_xext)(Display *, Window, int
+@@ -56,6 +73,11 @@ extern int (*XShapeQueryExtents_dylibloader_wrapper_xext)(Display *, Window, int
  extern void (*XShapeSelectInput_dylibloader_wrapper_xext)(Display *, Window, unsigned long);
  extern unsigned long (*XShapeInputSelected_dylibloader_wrapper_xext)(Display *, Window);
  extern XRectangle *(*XShapeGetRectangles_dylibloader_wrapper_xext)(Display *, Window, int, int *, int *);
@@ -400,9 +464,18 @@ index 545665c..6fa3b67 100644
  #ifdef __cplusplus
  }
 diff --git a/platform/linuxbsd/x11/gl_manager_x11.h b/platform/linuxbsd/x11/gl_manager_x11.h
-index 77e370e..904d3ee 100644
+index 77e370e..45fc369 100644
 --- a/platform/linuxbsd/x11/gl_manager_x11.h
 +++ b/platform/linuxbsd/x11/gl_manager_x11.h
+@@ -56,7 +56,7 @@ private:
+ 	struct GLWindow {
+ 		bool in_use = false;
+ 
+-		// the external ID .. should match the GL window number .. unused I think
++		// the display server's ID for this window; get_current_window_id() returns it
+ 		DisplayServerEnums::WindowID window_id = DisplayServerEnums::INVALID_WINDOW_ID;
+ 		int width = 0;
+ 		int height = 0;
 @@ -112,6 +112,7 @@ public:
  	void swap_buffers();
  
