@@ -1,7 +1,7 @@
 Wait longer in the X11 events thread once neither input nor frames have come for half a second.
 
 The loop waited 1 ms in select() on every pass, waking about a thousand times a second while the
-app was idle. The wait now follows the last activity: 1 ms while events arrived or a frame was
+app was idle. The wait now follows the last activity: 0.5 ms while events arrived or a frame was
 swapped within the last 500 ms, and 100 ms after that. The renderer's buffer swaps (GLX and
 Present) share the display connection and can read events off the socket into xcb's queue, where
 select() cannot see them, so a drawing app keeps the short wait; swap_buffers() records the time
@@ -9,24 +9,30 @@ in last_frame_usec for the events thread. Before waiting, XEventsQueued with Que
 moves what waits on the socket and in xcb's queue into Xlib's queue, and the wait is skipped
 when an event is there.
 
+The short wait is 0.5 ms, shorter than the 1 ms it replaces, because a quiet app lets the
+processor reach its deepest idle state between frames while the user works. On an i7-10750H that
+state exits in about 1 ms and flushes the core's caches, which made edits up to 3.5 ms slower;
+the extra wakeups while active keep the cores out of it, and an idle app still sleeps.
+
 Races left open: a main-thread round trip while nothing draws, more than 500 ms after the last
 input, can read an event that the 100 ms select() then misses, so that event is handled up to
 100 ms later. Pointer motion over other windows reaches the events thread through the root
-window's raw motion events (XI_RawMotion), which keeps the 1 ms wait while the pointer moves
+window's raw motion events (XI_RawMotion), which keeps the short wait while the pointer moves
 anywhere.
 
 diff --git a/platform/linuxbsd/x11/display_server_x11.cpp b/platform/linuxbsd/x11/display_server_x11.cpp
-index 6936b32..d427d91 100644
+index 6936b32..163a018 100644
 --- a/platform/linuxbsd/x11/display_server_x11.cpp
 +++ b/platform/linuxbsd/x11/display_server_x11.cpp
-@@ -4693,15 +4693,32 @@ bool DisplayServerX11::_wait_for_events(int timeout_seconds, int timeout_microse
+@@ -4693,15 +4693,33 @@ bool DisplayServerX11::_wait_for_events(int timeout_seconds, int timeout_microse
  }
  
  void DisplayServerX11::_poll_events() {
 +	// select() cannot see events another call on this connection already read off the socket into
 +	// Xlib's or xcb's queue, such as a round trip or the renderer's buffer swap on the main thread.
 +	// So the wait is short while input keeps coming or frames are drawn, and long once neither
-+	// happened for half a second.
++	// happened for half a second. The short wait also keeps the processor out of its deepest idle
++	// states between frames, whose exit latency and cache flush would slow the next frame.
 +	uint64_t last_event_usec = OS::get_singleton()->get_ticks_usec();
  	while (!events_thread_done.is_set()) {
 -		// Wait with a shorter timeout from the events thread to avoid delayed inputs.
@@ -37,7 +43,7 @@ index 6936b32..d427d91 100644
 +		// QueuedAfterFlush also moves what waits on the socket and in xcb's queue into Xlib's, so
 +		// an event read before this check is handled without waiting.
 +		if (XEventsQueued(x11_display, QueuedAfterFlush) == 0) {
-+			_wait_for_events(0, idle ? 100000 : 1000);
++			_wait_for_events(0, idle ? 100000 : 500);
 +		}
  
  		// Process events from the queue.
@@ -54,7 +60,7 @@ index 6936b32..d427d91 100644
  		}
  	}
  }
-@@ -5765,6 +5782,7 @@ void DisplayServerX11::release_rendering_thread() {
+@@ -5765,6 +5783,7 @@ void DisplayServerX11::release_rendering_thread() {
  }
  
  void DisplayServerX11::swap_buffers() {
