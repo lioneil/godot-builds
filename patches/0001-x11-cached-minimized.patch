@@ -1,0 +1,33 @@
+Read the minimized state from the cached window data instead of the window manager.
+
+window_can_draw() and can_any_window_draw() called window_get_mode(), which reads _NET_WM_STATE
+from the X server twice per call, and the main loop calls these two functions on every pass.
+WindowData::minimized is kept current by _update_wm_state_hints() on PropertyNotify, so the
+cached value gives the same answer without a round trip.
+
+diff --git a/platform/linuxbsd/x11/display_server_x11.cpp b/platform/linuxbsd/x11/display_server_x11.cpp
+index 65c9a3e..6936b32 100644
+--- a/platform/linuxbsd/x11/display_server_x11.cpp
++++ b/platform/linuxbsd/x11/display_server_x11.cpp
+@@ -3488,15 +3488,18 @@ bool DisplayServerX11::window_is_focused(DisplayServerEnums::WindowID p_window)
+ }
+ 
+ bool DisplayServerX11::window_can_draw(DisplayServerEnums::WindowID p_window) const {
+-	//this seems to be all that is provided by X11
+-	return window_get_mode(p_window) != DisplayServerEnums::WINDOW_MODE_MINIMIZED;
++	_THREAD_SAFE_METHOD_
++
++	ERR_FAIL_COND_V(!windows.has(p_window), false);
++	// `minimized` follows _NET_WM_STATE through PropertyNotify, so no round trip is needed.
++	return !windows[p_window].minimized;
+ }
+ 
+ bool DisplayServerX11::can_any_window_draw() const {
+ 	_THREAD_SAFE_METHOD_
+ 
+ 	for (const KeyValue<DisplayServerEnums::WindowID, WindowData> &E : windows) {
+-		if (window_get_mode(E.key) != DisplayServerEnums::WINDOW_MODE_MINIMIZED) {
++		if (!E.value.minimized) {
+ 			return true;
+ 		}
+ 	}

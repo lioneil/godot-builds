@@ -1,0 +1,42 @@
+Wait longer in the X11 events thread once no input has come for half a second.
+
+The loop waited 1 ms in select() on every pass, waking about a thousand times a second while the
+app was idle. The wait is now skipped when Xlib already holds queued events (XEventsQueued with
+QueuedAlready), 1 ms while events arrived within the last 500 ms, and 100 ms after that.
+
+Race left open: an event that the main thread reads into Xlib's queue between the queued check
+and select() is invisible to select(), so the events thread handles it up to 100 ms later.
+
+diff --git a/platform/linuxbsd/x11/display_server_x11.cpp b/platform/linuxbsd/x11/display_server_x11.cpp
+index 6936b32..b1b3a39 100644
+--- a/platform/linuxbsd/x11/display_server_x11.cpp
++++ b/platform/linuxbsd/x11/display_server_x11.cpp
+@@ -4693,15 +4693,26 @@ bool DisplayServerX11::_wait_for_events(int timeout_seconds, int timeout_microse
+ }
+ 
+ void DisplayServerX11::_poll_events() {
++	// select() cannot see events another thread's Xlib call already read into Xlib's queue, so the
++	// wait is short while input keeps coming, and long once none came for half a second.
++	uint64_t last_event_usec = OS::get_singleton()->get_ticks_usec();
+ 	while (!events_thread_done.is_set()) {
+-		// Wait with a shorter timeout from the events thread to avoid delayed inputs.
+-		_wait_for_events(0, 1000);
++		const bool idle = OS::get_singleton()->get_ticks_usec() - last_event_usec > 500000;
++		if (XEventsQueued(x11_display, QueuedAlready) == 0) {
++			_wait_for_events(0, idle ? 100000 : 1000);
++		}
+ 
+ 		// Process events from the queue.
++		bool got_events = false;
+ 		{
+ 			MutexLock mutex_lock(events_mutex);
+ 
++			const uint32_t before = polled_events.size();
+ 			_check_pending_events(polled_events);
++			got_events = polled_events.size() > before;
++		}
++		if (got_events) {
++			last_event_usec = OS::get_singleton()->get_ticks_usec();
+ 		}
+ 	}
+ }
